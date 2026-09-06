@@ -1,0 +1,135 @@
+openapi: 3.1.0
+info:
+  title: Rx Lens API
+  version: 0.1.0-poc
+  description: Smart India Hackathon SIH26047 patient case-taking POC API.
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Backend is running.
+  /sessions:
+    post:
+      summary: Create a demo patient session
+      responses:
+        "201":
+          description: Session, patient identity, and first prompt.
+  /consent:
+    post:
+      summary: Record patient consent
+      responses:
+        "201":
+          description: Consent recorded.
+  /sessions/mode:
+    post:
+      summary: Select General Medicine or AYUSH pathway
+      responses:
+        "200":
+          description: Updated session and next prompt.
+  /conversation/message:
+    post:
+      summary: Submit a guided history answer
+      responses:
+        "200":
+          description: Structured fact, next prompt, and red flags.
+  /documents:
+    post:
+      summary: Upload PNG/JPG medical document for real OCR
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - session_id
+                - file
+              properties:
+                session_id:
+                  type: string
+                doc_type_hint:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "202":
+          description: OCR text, structured document facts, and evidence.
+  /documents/process:
+    post:
+      summary: Process included demo documents through OCR
+      responses:
+        "200":
+          description: Processed demo documents, facts, and evidence.
+  /patients/{patient_id}:
+    get:
+      summary: Fetch demo patient record
+      parameters:
+        - in: path
+          name: patient_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Patient record.
+  /timeline/{session_id}:
+    get:
+      summary: Fetch chronological clinical timeline
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Timeline events.
+  /evidence/{session_id}:
+    get:
+      summary: Fetch evidence reconciliation results
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conflict and abnormal-value evidence.
+  /summary/{session_id}:
+    get:
+      summary: Generate physician-facing case summary
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Structured physician draft.
+  /physician/review:
+    post:
+      summary: Record physician amend/reject/approve decision
+      responses:
+        "200":
+          description: Physician review saved.
+  /fhir/export:
+    post:
+      summary: Export FHIR-like bundle after physician approval
+      responses:
+        "200":
+          description: FHIR-like Bundle.
+        "403":
+          description: Physician approval required.
+  /sync/mock:
+    post:
+      summary: Simulate ABDM/HIS sync
+      responses:
+        "200":
+          description: Mock sync success.
