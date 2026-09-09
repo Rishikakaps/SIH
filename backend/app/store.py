@@ -24,6 +24,7 @@ class MemoryStore:
         self.facts: dict[str, list[ClinicalFact]] = defaultdict(list)
         self.flags: dict[str, list[ClinicalFlag]] = defaultdict(list)
         self.documents: dict[str, list[DocumentRecord]] = defaultdict(list)
+        self.document_images: dict[str, bytes] = {}
         self.evidence: dict[str, list[EvidenceRecord]] = defaultdict(list)
         self.timeline: dict[str, list[TimelineEvent]] = defaultdict(list)
         self.reviews: dict[str, PhysicianReview] = {}

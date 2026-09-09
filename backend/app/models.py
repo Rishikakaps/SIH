@@ -66,6 +66,7 @@ class Session(BaseModel):
     pending_fields: list[str] = Field(default_factory=list)
     completed: bool = False
     synced: bool = False
+    revision: int = 0
 
 
 class ClinicalFact(BaseModel):
@@ -98,6 +99,10 @@ class DocumentRecord(BaseModel):
     doc_type_hint: str | None = None
     status: str = "processed"
     ocr_text: str
+    original_ocr_text: str = ""
+    revision: int = 0
+    ai_suggestion: dict[str, Any] | None = None
+    review_notes: list[str] = Field(default_factory=list)
     confidence: float = 0.94
     extracted: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=now_iso)

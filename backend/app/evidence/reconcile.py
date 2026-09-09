@@ -13,10 +13,14 @@ def reconcile(session_id: str, facts: list[ClinicalFact]) -> list[EvidenceRecord
 
     for key, grouped in groups.items():
         if key == "hba1c":
-            value = float(grouped[0].value)
-            low, high = grouped[0].metadata.get("reference_range", [0, 999])
-            if value < low or value > high:
-                records.append(EvidenceRecord(session_id=session_id, ontology_path=grouped[0].ontology_path, status=EvidenceStatus.out_of_range, message="HbA1c is outside the supplied reference range and requires physician review.", fact_ids=[f.id for f in grouped]))
+            for fact in grouped:
+                reference = fact.metadata.get("reference_range")
+                if reference and len(reference) == 2:
+                    value = float(fact.value)
+                    if value < reference[0] or value > reference[1]:
+                        records.append(EvidenceRecord(session_id=session_id, ontology_path=fact.ontology_path, status=EvidenceStatus.out_of_range, message="HbA1c is outside the supplied reference range and requires physician review.", fact_ids=[fact.id]))
+                else:
+                    records.append(EvidenceRecord(session_id=session_id, ontology_path=fact.ontology_path, status=EvidenceStatus.unverified, message="No reference range supplied; physician review required.", fact_ids=[fact.id]))
             continue
 
         patient_values = [_normalize(f.value) for f in grouped if f.source == FactSource.patient_interview]

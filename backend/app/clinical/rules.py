@@ -1,21 +1,18 @@
 from __future__ import annotations
-
+import re
 from ..models import ClinicalFact, ClinicalFlag
 
 
 def evaluate_red_flags(session_id: str, facts: list[ClinicalFact], existing_codes: set[str]) -> list[ClinicalFlag]:
-    text = " ".join(f.value.lower() for f in facts)
-    new_flags: list[ClinicalFlag] = []
-    if "RF_CHEST_PAIN_DYSPNEA" not in existing_codes:
-        has_chest_pain = "chest pain" in text or "सीने" in text
-        has_dyspnea = any(term in text for term in ["breathless", "breathlessness", "sweating", "sweaty", "सांस", "पसीना"])
-        if has_chest_pain and has_dyspnea:
-            new_flags.append(
-                ClinicalFlag(
-                    session_id=session_id,
-                    code="RF_CHEST_PAIN_DYSPNEA",
-                    reason="Chest pain with breathlessness or sweating requires priority triage verification.",
-                    triggering_fact_ids=[f.id for f in facts if any(term in f.value.lower() for term in ["chest pain", "breath", "sweat", "सीने", "सांस", "पसीना"])],
-                )
-            )
-    return new_flags
+    # Limited demo rule. Discard explicit negations before checking positive symptoms.
+    def positive(value):
+        text = value.lower()
+        text = re.sub(r"(?:no|not|without|denies)\s+(?:(?:any|having)\s+)?(?:chest pain|breathlessness|breathless|sweating)(?:\s+(?:or|and)\s+(?:breathlessness|sweating))?", "", text)
+        text = re.sub(r"(?:साँस|सांस)\s+नहीं\s+फूलती|(?:साँस|सांस)\s+फूलना\s+नहीं|पसीना\s+नहीं(?:\s+आता)?|(?:सीने|छाती)\s+में\s+दर्द\s+नहीं", "", text)
+        return text
+    texts = [(f, positive(f.value)) for f in facts]
+    chest = [f.id for f, t in texts if any(s in t for s in ["chest pain", "pain in my chest", "सीने में दर्द", "छाती में दर्द"])]
+    breath = [f.id for f, t in texts if any(s in t for s in ["breathless", "sweating", "सांस फूल", "साँस फूल", "पसीना"])]
+    if chest and breath and "RF_CHEST_PAIN_DYSPNEA" not in existing_codes:
+        return [ClinicalFlag(session_id=session_id, code="RF_CHEST_PAIN_DYSPNEA", reason="Chest pain with breathlessness or sweating requires priority triage verification.", triggering_fact_ids=list(dict.fromkeys(chest + breath)))]
+    return []

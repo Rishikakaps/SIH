@@ -1,0 +1,10 @@
+**/node_modules
+**/.next
+**/__pycache__
+**/.pytest_cache
+**/.ocr-models
+.venv
+.git
+**/.env
+**/.env.*
+!**/.env.example

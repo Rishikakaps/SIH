@@ -1,261 +1,145 @@
 "use client";
+import { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ArrowLeft, ArrowRight, Check, CheckCircle2, ChevronRight, FileScan, HeartPulse, Languages, LoaderCircle, Mic, Pencil, Plus, ShieldCheck, Square, Stethoscope, Volume2 } from "lucide-react";
+import { useSpeech } from "./useSpeech";
+import { useRecordedSpeech } from "./useRecordedSpeech";
+import { AiStatus, DeleteDocumentButton, DocumentEditor, Welcome } from "./screens";
 
-import { ChangeEvent, useMemo, useState } from "react";
-import { FileScan, HeartPulse, Languages, Mic, RefreshCcw, Send, ShieldCheck, Stethoscope, Volume2 } from "lucide-react";
+const API = process.env.NEXT_PUBLIC_API_BASE_URL || "/api";
+export type Lang = "en" | "hi";
+type Mode = "general_medicine" | "ayush";
+type Session = { id: string; language: Lang; mode: Mode; revision: number; completed: boolean };
+type Prompt = { completed: boolean; current_field: string | null; question: string | null; options: string[]; option_labels: string[]; remaining: number; physician_pending_fields: string[] };
+type Fact = { id: string; label: string; value: string; source: string; question?: string; display_value?: string };
+type AiSuggestion = { id: string; corrected_text: string; quality_notes: string; uncertainties: { location: string; reason: string }[] };
+export type Doc = { source_available: boolean; original_ocr_text: string; revision: number; ai_suggestion: AiSuggestion | null; id: string; filename: string; ocr_text: string; confidence: number; status: string; extracted: Record<string, unknown> };
+type State = { session: Session; next: Prompt; facts: Fact[]; flags: { code: string; reason: string }[]; documents: Doc[]; evidence: { id: string; status: string; message: string }[] };
+type Bundle = { resourceType: string; entry?: { resource: { resourceType: string } }[] };
 
-const API = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
-const steps = ["Identify", "Consent", "Mode", "History", "Documents", "Review", "Physician", "Sync", "Architecture"];
-
-type Session = { id: string; patient_id: string; mode: string; language: string };
-type Patient = { id: string; name: string; age: number; sex: string; abha_id: string; opd: string };
-type Prompt = { completed: boolean; current_field: string | null; question: string | null; options: string[]; physician_pending_fields: string[] };
-type Flag = { code: string; reason: string };
-type Fact = { id: string; label: string; value: string; ontology_path: string; source: string; source_ref?: string; metadata?: Record<string, unknown> };
-type Evidence = { status: string; message: string; fact_ids: string[] };
-type DocumentRecord = { id: string; filename: string; ocr_text: string; confidence: number; extracted: any };
-type LoadState = "idle" | "loading" | "success" | "error";
-type ReviewState = "draft" | "editing" | "approved" | "rejected";
+async function request(path: string, body?: unknown, form?: FormData, method = "POST") {
+  let response: Response;
+  try { response = await fetch(`${API}${path}`, { method: body || form ? method : "GET", headers: form ? undefined : { "Content-Type": "application/json" }, body: form || (body ? JSON.stringify(body) : undefined), signal: AbortSignal.timeout(path.includes("documents") ? 300000 : 30000) }); }
+  catch (error) { throw new Error(error instanceof Error && error.name === "TimeoutError" ? "The request timed out. Check the backend terminal before retrying." : "Cannot connect to the backend. Start the backend server and try again."); }
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(typeof result?.detail === "string" ? result.detail : `Request failed (${response.status}). Check the backend terminal and retry.`);
+  return result;
+}
 
 export default function Home() {
-  const [step, setStep] = useState(0);
-  const [maxStep, setMaxStep] = useState(0);
-  const [language, setLanguage] = useState<"en" | "hi">("hi");
-  const [session, setSession] = useState<Session | null>(null);
-  const [patient, setPatient] = useState<Patient | null>(null);
-  const [consentChecked, setConsentChecked] = useState(false);
-  const [prompt, setPrompt] = useState<Prompt | null>(null);
-  const [facts, setFacts] = useState<Fact[]>([]);
-  const [flags, setFlags] = useState<Flag[]>([]);
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [evidence, setEvidence] = useState<Evidence[]>([]);
-  const [summary, setSummary] = useState<any>(null);
-  const [editedSummary, setEditedSummary] = useState("");
-  const [fhir, setFhir] = useState<any>(null);
-  const [synced, setSynced] = useState(false);
-  const [loading, setLoading] = useState<LoadState>("idle");
-  const [loadingText, setLoadingText] = useState("");
-  const [error, setError] = useState("");
-  const [voiceState, setVoiceState] = useState<"idle" | "listening" | "ready">("idle");
-  const [reviewState, setReviewState] = useState<ReviewState>("draft");
-
-  const redFlag = flags.length > 0;
-  const visibleFacts = useMemo(() => facts.slice(-10), [facts]);
-
-  function go(next: number) {
-    if (next <= maxStep || next === 8) setStep(next);
+  const [language, setLanguage] = useState<Lang>("en");
+  const t = (en: string, hi: string) => language === "hi" ? hi : en;
+  const [step, setStep] = useState(0), [furthest, setFurthest] = useState(0);
+  const [ai, setAi] = useState<AiStatus | null>(null);
+  const [dirtyDocs, setDirtyDocs] = useState<Record<string, boolean>>({});
+  const markDirty = useCallback((id: string, dirty: boolean) => setDirtyDocs(current => current[id] === dirty ? current : { ...current, [id]: dirty }), []);
+  const hasUnsavedDocuments = Object.values(dirtyDocs).some(Boolean);
+  const [data, setData] = useState<State | null>(null);
+  const [ocrLanguage, setOcrLanguage] = useState<Lang>("en");
+  const [consented, setConsented] = useState(false), [draft, setDraft] = useState("");
+  const [inputType, setInputType] = useState("typed_text");
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const [modeChange, setModeChange] = useState<Mode | null>(null);
+  const [editTarget, setEditTarget] = useState<Fact | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [summary, setSummary] = useState("");
+  const [review, setReview] = useState<"draft" | "approved" | "rejected">("draft");
+  const [bundle, setBundle] = useState<Bundle | null>(null), [synced, setSynced] = useState(false);
+  const lock = useRef(false), heading = useRef<HTMLHeadingElement>(null);
+  const [voiceMode, setVoiceMode] = useState<"api" | "browser">("api");
+  const [allowVoiceCloud, setAllowVoiceCloud] = useState(false);
+  const browserSpeech = useSpeech(language, `${step}:${data?.next.current_field}`, text => { setDraft(text); setInputType("voice_transcript"); });
+  const recordedSpeech = useRecordedSpeech(API, language, `${step}:${data?.session.id}:${data?.next.current_field}:${data?.session.revision}`, data?.session.id, data?.session.revision || 0, allowVoiceCloud, text => { setDraft(text); setInputType("voice_transcript"); });
+  const speech = voiceMode === "api" ? recordedSpeech : browserSpeech;
+  const voiceProcessing = voiceMode === "api" && recordedSpeech.processing;
+  const voicePending = voiceMode === "api" && recordedSpeech.hasRecording;
+  const steps = [t("Welcome", "स्वागत"), t("Consent", "सहमति"), t("Care mode", "देखभाल मोड"), t("Your history", "आपका इतिहास"), t("Documents", "दस्तावेज़"), t("Review", "समीक्षा"), t("Physician", "चिकित्सक"), t("Export", "निर्यात")];
+  const answers = data?.facts.filter(f => f.source === "patient_interview") || [];
+  const blocked = busy || speech.listening || voiceProcessing || voicePending;
+  useEffect(() => { document.documentElement.lang = language; }, [language]);
+  useEffect(() => { heading.current?.focus(); window.speechSynthesis?.cancel(); }, [step]);
+  useEffect(() => { request("/ai/status").then(setAi).catch(() => setAi(null)); }, [step]);
+  function removeDocument(doc: Doc) { void run(async () => { const result = await request(`/documents/${doc.id}`, { session_id: data?.session.id, revision: doc.revision }, undefined, "DELETE"); markDirty(doc.id, false); apply(result); }); }
+  function go(next: number) { if (step === 5 && hasUnsavedDocuments && next !== 5) { setError(t("Save or discard your document text edits before continuing.", "आगे बढ़ने से पहले दस्तावेज़ के बदलाव सहेजें या रद्द करें।")); return; } setStep(next); setFurthest(current => Math.max(current, next)); setError(""); }
+  function apply(result: State, changed = true) { setData(result); if (changed) { setSummary(""); setBundle(null); setReview("draft"); setSynced(false); setFurthest(result.next.completed ? 5 : 3); } }
+  async function run(action: () => Promise<void>) {
+    if (lock.current) return;
+    lock.current = true; setBusy(true); setError("");
+    try { await action(); } catch (caught) { setError(caught instanceof Error ? caught.message : "Please retry."); }
+    finally { lock.current = false; setBusy(false); }
   }
-
-  function advance(next: number) {
-    setMaxStep((current) => Math.max(current, next));
-    setStep(next);
+  function changeLanguage(next: Lang) {
+    if (next === language) return;
+    speech.cancel(); window.speechSynthesis?.cancel();
+    void run(async () => { if (data) apply(await request("/sessions/language", { session_id: data.session.id, language: next }), false); setLanguage(next); });
   }
-
-  async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
-    setError("");
-    setLoading("loading");
-    setLoadingText(label);
-    try {
-      const result = await action();
-      setLoading("success");
-      return result;
-    } catch (caught) {
-      setLoading("error");
-      setError(caught instanceof Error ? caught.message : "Something went wrong. Please retry this step.");
-      return null;
-    }
+  function start() { void run(async () => { if (!data) { const result = await request("/sessions", { language, mode: "general_medicine" }); setData({ session: result.session, next: result.next, facts: [], flags: [], documents: [], evidence: [] }); } go(1); }); }
+  function chooseMode(mode: Mode, reset = false) {
+    if (!data) return;
+    if (mode !== data.session.mode && answers.length && !reset) { setModeChange(mode); return; }
+    void run(async () => { apply(await request("/sessions/mode", { session_id: data.session.id, mode, reset_history: reset }), mode !== data.session.mode); setModeChange(null); setDraft(""); go(3); });
   }
-
-  async function createSession() {
-    const res = await run("Preparing demo ABHA session...", () => postJson("/sessions", { language, mode: "general_medicine" }));
-    if (!res) return;
-    setSession(res.session);
-    setPatient(res.patient);
-    setPrompt(res.next);
-    advance(1);
+  function sendAnswer() {
+    if (!data || !draft.trim() || speech.listening || voiceProcessing || voicePending) return;
+    void run(async () => { const result = await request("/conversation/message", { session_id: data.session.id, revision: data.session.revision, content: draft.trim(), input_type: inputType }); apply(result); setDraft(""); setInputType("typed_text"); if (result.next.completed) go(4); });
   }
-
-  async function consent() {
-    if (!consentChecked || !session) return;
-    const res = await run("Recording consent...", () => postJson("/consent", { session_id: session.id, scope: ["history", "documents", "physician_sharing"], language }));
-    if (res) advance(2);
+  function rewind(fact: Fact) {
+    if (!data) return;
+    void run(async () => { const result = await request("/conversation/rewind", { session_id: data.session.id, fact_id: fact.id, revision: data.session.revision }); apply(result); setDraft(result.previous_answer); setInputType(result.next.options.includes(result.previous_answer) ? "tapped_option" : "typed_text"); setEditTarget(null); go(3); });
   }
-
-  async function selectMode(mode: "general_medicine" | "ayush") {
-    if (!session) return;
-    const res = await run("Loading clinical pathway...", () => postJson("/sessions/mode", { session_id: session.id, mode }));
-    if (!res) return;
-    setSession(res.session);
-    setPrompt(res.next);
-    advance(3);
+  function backAnswer() { if (answers.length) rewind(answers[answers.length - 1]); else go(2); }
+  function upload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]; event.target.value = "";
+    if (!file || !data) return;
+    if (file.size > 10 * 1024 * 1024) { setError(t("Choose an image smaller than 10 MB.", "10 MB से छोटी तस्वीर चुनें।")); return; }
+    if (!/\.(png|jpe?g)$/i.test(file.name)) { setError(t("Choose a PNG or JPEG image.", "PNG या JPEG तस्वीर चुनें।")); return; }
+    const form = new FormData(); form.append("session_id", data.session.id); form.append("file", file); form.append("ocr_language", ocrLanguage);
+    void run(async () => { apply(await request("/documents", undefined, form)); });
   }
-
-  async function submitAnswer(content: string, inputType = "tapped_option") {
-    if (!session) return;
-    const res = await run("Structuring patient response...", () => postJson("/conversation/message", { session_id: session.id, input_type: inputType, content }));
-    if (!res) return;
-    setFacts((current) => [...current, res.fact]);
-    setPrompt(res.next);
-    setFlags(res.flags);
-    if (res.next.completed) advance(4);
+  function loadSummary() { if (!data) return; void run(async () => { const result = await request(`/summary/${data.session.id}`); setSummary(JSON.stringify(result.sections, null, 2)); setReview("draft"); go(6); }); }
+  function speak() {
+    if (!("speechSynthesis" in window)) { setError(t("Read aloud is unavailable in this browser.", "इस ब्राउज़र में पढ़कर सुनाना उपलब्ध नहीं है।")); return; }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(step === 1 ? t("We will collect your answers and read your uploaded medical documents for physician review. This is a demo session.", "हम आपके उत्तर और चिकित्सा दस्तावेज़ डॉक्टर की समीक्षा के लिए एकत्र करेंगे। यह एक डेमो सत्र है।") : data?.next.question || "");
+    utterance.lang = language === "hi" ? "hi-IN" : "en-IN";
+    utterance.onerror = () => setError(t("Read aloud failed. Check that a voice for this language is installed.", "पढ़कर सुनाना विफल हुआ। इस भाषा की आवाज़ उपलब्ध है या नहीं, जाँचें।"));
+    window.speechSynthesis.speak(utterance);
   }
+  function reset() { speech.cancel(); window.speechSynthesis?.cancel(); setData(null); setDirtyDocs({}); setStep(0); setFurthest(0); setConsented(false); setAllowVoiceCloud(false); setDraft(""); setSummary(""); setBundle(null); setSynced(false); setReview("draft"); setResetOpen(false); setEditTarget(null); setModeChange(null); setError(""); }
 
-  async function sandboxVoice() {
-    setVoiceState("listening");
-    await delay(900);
-    setVoiceState("ready");
-    await submitAnswer("Chest pain", "voice_transcript");
-  }
-
-  async function uploadDocument(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file || !session) return;
-    const form = new FormData();
-    form.append("session_id", session.id);
-    form.append("doc_type_hint", file.name.toLowerCase().includes("lab") ? "lab_report" : "prescription");
-    form.append("file", file);
-    const res = await run("Uploading... Reading document... Extracting clinical information...", async () => {
-      const response = await fetch(`${API}/documents`, { method: "POST", body: form });
-      if (!response.ok) throw new Error("upload failed");
-      return response.json();
-    });
-    if (!res) return;
-    setDocuments((current) => [...current, res.document]);
-    setFacts((current) => [...current, ...res.facts]);
-    setEvidence(res.evidence);
-    advance(5);
-  }
-
-  async function processDemoDocuments() {
-    if (!session) return;
-    const res = await run("Rendering demo documents... Running EasyOCR... Structuring evidence...", () => postJson("/documents/process", { session_id: session.id }));
-    if (!res) return;
-    setDocuments((current) => [...current, ...(res.documents || [])]);
-    setFacts((current) => [...current, ...res.facts]);
-    setEvidence(res.evidence);
-    advance(5);
-  }
-
-  async function loadSummary() {
-    if (!session) return;
-    const res = await run("Generating physician draft...", async () => {
-      const response = await fetch(`${API}/summary/${session.id}`);
-      if (!response.ok) throw new Error("summary failed");
-      return response.json();
-    });
-    if (!res) return;
-    setSummary(res);
-    setEditedSummary(JSON.stringify(res.sections, null, 2));
-    setReviewState("draft");
-    advance(6);
-  }
-
-  async function approveAndExport() {
-    if (!session || reviewState === "rejected") return;
-    const res = await run("Saving physician review and preparing FHIR record...", async () => {
-      await postJson("/physician/review", { session_id: session.id, physician_id: "dr_demo", decision: "accept", edits: { summary_text: editedSummary } });
-      return postJson("/fhir/export", { session_id: session.id });
-    });
-    if (!res) return;
-    setReviewState("approved");
-    setFhir(res);
-    advance(7);
-  }
-
-  async function rejectDraft() {
-    if (!session) return;
-    await run("Recording rejected draft...", () => postJson("/physician/review", { session_id: session.id, physician_id: "dr_demo", decision: "reject", edits: { summary_text: editedSummary } }));
-    setReviewState("rejected");
-  }
-
-  async function sync() {
-    if (!session || !fhir) return;
-    const res = await run("Sending to simulated ABDM/HIS connector...", () => postJson("/sync/mock", { session_id: session.id }));
-    if (res) setSynced(true);
-  }
-
-  return (
-    <main className="shell">
-      <aside className="rail">
-        <div>
-          <p className="eyebrow">SIH26047 sandbox</p>
-          <h1>Rx Lens</h1>
-          <p className="sub">Prepare a patient history before the doctor meets the patient.</p>
-        </div>
-        <nav className="steps">
-          {steps.map((item, index) => (
-            <button key={item} disabled={index > maxStep && index !== 8} className={`step ${index === step ? "active" : ""} ${index < step ? "done" : ""}`} onClick={() => go(index)}>
-              {index + 1}. {item}
-            </button>
-          ))}
-        </nav>
-        <button className="ghost" onClick={() => window.location.reload()}><RefreshCcw size={16} /> Finish Session</button>
-      </aside>
-      <section className="stage">
-        <header className="topbar">
-          <div><p className="eyebrow">{step >= 6 ? "Physician workspace" : "Patient kiosk"}</p><h2>{steps[step]}</h2></div>
-          <span className={`chip ${synced ? "green" : ""}`}>{synced ? "Sandbox Sync Complete" : "Unsynced"}</span>
-        </header>
-        {loading === "loading" && <div className="panel"><span className="chip amber">{loadingText}</span></div>}
-        {error && <div className="panel alert"><h3>{error}</h3></div>}
-        {redFlag && <div className="panel alert"><span className="chip red">Priority clinical attention recommended</span><h3>Reason: chest pain with breathlessness</h3><p>{flags[0].reason}</p></div>}
-        {step === 0 && <IdentifyScreen language={language} setLanguage={setLanguage} createSession={createSession} />}
-        {step === 1 && <ConsentScreen checked={consentChecked} setChecked={setConsentChecked} consent={consent} />}
-        {step === 2 && <ModeScreen patient={patient} selectMode={selectMode} />}
-        {step === 3 && <InterviewScreen prompt={prompt} submitAnswer={submitAnswer} sandboxVoice={sandboxVoice} voiceState={voiceState} />}
-        {step === 4 && <DocumentsScreen uploadDocument={uploadDocument} processDemoDocuments={processDemoDocuments} />}
-        {step === 5 && <ReviewScreen documents={documents} facts={visibleFacts} evidence={evidence} loadSummary={loadSummary} />}
-        {step === 6 && <PhysicianScreen patient={patient} evidence={evidence} prompt={prompt} summary={summary} editedSummary={editedSummary} setEditedSummary={setEditedSummary} reviewState={reviewState} setReviewState={setReviewState} approveAndExport={approveAndExport} rejectDraft={rejectDraft} />}
-        {step === 7 && <FhirScreen fhir={fhir} sync={sync} synced={synced} />}
-        {step === 8 && <ArchitecturePanel />}
-      </section>
-    </main>
-  );
+  return <main className="shell">
+    <aside className="rail">
+      <div className="brand"><span className="brand-mark"><HeartPulse size={25} /></span><span>rx lens<span className="brand-sub">{t("CARE STARTS WITH LISTENING", "बेहतर देखभाल, आपकी बात से")}</span></span></div>
+      <div className="rail-caption">{t("YOUR VISIT, STEP BY STEP", "आपकी मुलाक़ात, चरण दर चरण")}</div>
+      <nav aria-label={t("Visit progress", "मुलाक़ात की प्रगति")} className="steps">{steps.map((label, index) => <button key={index} className={`step ${step === index ? "active" : ""}`} aria-current={step === index ? "step" : undefined} disabled={blocked || index > furthest || (step === 5 && hasUnsavedDocuments && index !== 5)} onClick={() => go(index)}><span className="step-num">{index < step ? <Check size={14} /> : String(index + 1).padStart(2, "0")}</span>{label}{step === index && <ChevronRight size={16} />}</button>)}</nav>
+      <div className="rail-note"><ShieldCheck size={20} /><p>{t("Your story. A clearer consultation.", "आपकी बात। बेहतर परामर्श।")}<small>{t("Demo patient · Local session", "डेमो मरीज़ · स्थानीय सत्र")}</small></p></div>
+      {data && <button className="text-button restart" disabled={blocked} onClick={() => setResetOpen(true)}><Plus size={16} />{t("New session", "नया सत्र")}</button>}
+    </aside>
+    <section className="stage">
+      <header className="topbar"><div><span className="eyebrow">{t("PATIENT INTAKE", "मरीज़ पंजीकरण")}</span><h1 ref={heading} tabIndex={-1}>{steps[step]}</h1></div><div className="language-control"><Languages size={17} /><button disabled={busy} aria-pressed={language === "en"} onClick={() => changeLanguage("en")}>English</button><button disabled={busy} aria-pressed={language === "hi"} onClick={() => changeLanguage("hi")}>हिन्दी</button></div></header>
+      <div className="content">
+        {busy && <div className="status" role="status"><LoaderCircle className="spin" size={18} />{t("Working… OCR can take a few minutes on first use.", "प्रक्रिया चल रही है… पहली बार OCR में कुछ मिनट लग सकते हैं।")}</div>}
+        {error && <div className="notice error" role="alert"><strong>{t("We couldn’t complete that action.", "यह कार्य पूरा नहीं हुआ।")}</strong><p>{error}</p><button className="text-button" onClick={() => setError("")}>{t("Dismiss", "बंद करें")}</button></div>}
+        {Boolean(data?.flags.length) && <div className="notice warning" role="alert"><strong>{t("Priority clinical review", "प्राथमिकता से चिकित्सकीय समीक्षा")}</strong><p>{t("Reported chest pain with breathlessness or sweating needs physician verification.", "सीने में दर्द के साथ साँस फूलने या पसीने के बताए गए लक्षणों की डॉक्टर से जाँच आवश्यक है।")}</p></div>}
+        {resetOpen && <div className="notice"><h2>{t("Start a new session?", "नया सत्र शुरू करें?")}</h2><p>{t("The current session will close in this browser. Download any needed export first.", "इस ब्राउज़र में मौजूदा सत्र बंद हो जाएगा। आवश्यक निर्यात पहले डाउनलोड करें।")}</p><div className="actions"><button className="secondary" disabled={blocked} onClick={() => setResetOpen(false)}>{t("Keep session", "सत्र जारी रखें")}</button><button className="primary" disabled={blocked} onClick={reset}>{t("Start new session", "नया सत्र शुरू करें")}</button></div></div>}
+        {step === 0 && <Welcome language={language} busy={busy} start={start} />}
+        {step === 1 && <div className="panel narrow"><span className="icon-box"><ShieldCheck /></span><h2>{t("Your permission comes first.", "पहले आपकी अनुमति।")}</h2><p>{t("We’ll collect your answers and read your medical documents to prepare a draft for physician review.", "डॉक्टर की समीक्षा हेतु मसौदा बनाने के लिए हम आपके उत्तर और चिकित्सा दस्तावेज़ पढ़ेंगे।")}</p><div className="soft-box"><strong>{t("About this demo", "इस डेमो के बारे में")}</strong><p>{t("Rajesh Sharma is a demo patient. Records are held in server memory and disappear when the backend restarts. ABHA identity and hospital sync are simulated.", "राजेश शर्मा एक डेमो मरीज़ हैं। रिकॉर्ड सर्वर की मेमोरी में रहते हैं और बैकएंड दोबारा शुरू होने पर मिट जाते हैं। ABHA पहचान और अस्पताल सिंक का अनुकरण किया गया है।")}</p></div><label className="consent"><input type="checkbox" checked={consented} disabled={busy} onChange={e => setConsented(e.target.checked)} /><span>{t("I understand and agree to continue.", "मैं समझता/समझती हूँ और आगे बढ़ने की सहमति देता/देती हूँ।")}</span></label><div className="actions split"><button className="secondary" disabled={busy} onClick={speak}><Volume2 size={18} />{t("Listen", "सुनें")}</button><button className="primary" disabled={!consented || busy} onClick={() => void run(async () => { await request("/consent", { session_id: data?.session.id, scope: ["history", "documents", "physician_sharing"], language }); go(2); })}>{t("Agree & continue", "सहमत होकर आगे बढ़ें")}<ArrowRight size={18} /></button></div></div>}
+        {step === 2 && <><div className="section-heading"><span className="eyebrow">{t("CHOOSE YOUR PATH", "अपना विकल्प चुनें")}</span><h2>{t("What brings you here today?", "आज आप किस परामर्श के लिए आए हैं?")}</h2><p>{t("Choose the consultation that fits your visit. You can come back to change it.", "अपनी मुलाक़ात के अनुसार परामर्श चुनें। इसे बदलने के लिए वापस आ सकते हैं।")}</p></div><div className="mode-grid">{(["general_medicine", "ayush"] as Mode[]).map(mode => <button key={mode} className="panel mode-card" disabled={busy} onClick={() => chooseMode(mode)}><span className={`icon-box ${mode === "ayush" ? "sage" : ""}`}>{mode === "ayush" ? <HeartPulse /> : <Stethoscope />}</span><h3>{mode === "ayush" ? t("AYUSH care", "आयुष देखभाल") : t("General medicine", "सामान्य चिकित्सा")}</h3><p>{mode === "ayush" ? t("Share your symptoms, daily routine, diet, digestion, and wellbeing.", "लक्षण, दिनचर्या, आहार, पाचन और स्वास्थ्य की जानकारी दें।") : t("Tell us about your symptoms, medical history, medicines, and allergies.", "अपने लक्षण, चिकित्सा इतिहास, दवाओं और एलर्जी के बारे में बताएँ।")}</p><span className="mode-cta">{t("Choose this mode", "यह मोड चुनें")}<ArrowRight size={18} /></span></button>)}</div>{modeChange && <div className="notice"><h3>{t("Restart the interview in this mode?", "इस मोड में इतिहास दोबारा शुरू करें?")}</h3><p>{t("Changing mode clears interview answers and previous approval. Uploaded documents are kept.", "मोड बदलने पर इतिहास के उत्तर और पिछली स्वीकृति हटेंगे। अपलोड किए गए दस्तावेज़ सुरक्षित रहेंगे।")}</p><div className="actions"><button className="secondary" disabled={busy} onClick={() => setModeChange(null)}>{t("Cancel", "रद्द करें")}</button><button className="primary" disabled={busy} onClick={() => chooseMode(modeChange, true)}>{t("Change mode & restart", "मोड बदलें और दोबारा शुरू करें")}</button></div></div>}</>}
+        {step === 3 && <div className="interview-layout"><div className="panel interview"><div className="question-meta"><span className="badge">{data?.session.mode === "ayush" ? t("AYUSH care", "आयुष देखभाल") : t("General medicine", "सामान्य चिकित्सा")}</span><span>{answers.length} {t("answers saved", "उत्तर सहेजे गए")}</span></div>{data?.next.completed ? <><CheckCircle2 className="success-icon" size={40} /><h2>{t("Your history is ready.", "आपका इतिहास तैयार है।")}</h2><p>{t("Review an earlier answer or continue to your documents.", "पहले के उत्तर की समीक्षा करें या दस्तावेज़ों पर आगे बढ़ें।")}</p><button className="primary" disabled={blocked} onClick={() => go(4)}>{t("Continue to documents", "दस्तावेज़ों पर जाएँ")}<ArrowRight size={18} /></button></> : <><h2 className="question" aria-live="polite">{data?.next.question}</h2><button className="text-button" disabled={blocked} onClick={speak}><Volume2 size={17} />{t("Read question aloud", "प्रश्न सुनें")}</button><p className="answer-hint">{t("Choose a suggestion or answer in your own words.", "एक सुझाव चुनें या अपने शब्दों में उत्तर दें।")}</p><div className="options">{data?.next.options.map((option, i) => <button className={`option ${draft === option ? "selected" : ""}`} aria-pressed={draft === option} disabled={blocked} key={option} onClick={() => { setDraft(option); setInputType("tapped_option"); }}>{data.next.option_labels[i]}{draft === option && <Check size={17} />}</button>)}</div><label className="field-label" htmlFor="answer">{t("Your answer", "आपका उत्तर")}</label><textarea id="answer" maxLength={5000} value={inputType === "tapped_option" && data?.next.options.includes(draft) ? data.next.option_labels[data.next.options.indexOf(draft)] : draft} onChange={e => { setDraft(e.target.value); setInputType("typed_text"); }} disabled={blocked} placeholder={t("Type here, or use the microphone below…", "यहाँ लिखें या नीचे माइक्रोफ़ोन का उपयोग करें…")} /><div className="voice-controls"><label className="field-label" htmlFor="voice-mode">{t("Voice input method", "आवाज़ दर्ज करने का तरीका")}</label><select id="voice-mode" disabled={blocked} value={voiceMode} onChange={e => { browserSpeech.cancel(); recordedSpeech.cancel(); setVoiceMode(e.target.value as "api" | "browser"); }}><option value="api">{t("Record & transcribe · Groq API", "रिकॉर्ड करें और पाठ बनाएँ · Groq API")}</option><option value="browser">{t("Browser speech service", "ब्राउज़र वॉइस सेवा")}</option></select>
+        {voiceMode === "api" && <><p className="small-note">{t("Record up to 90 seconds, then press Stop. English, Hindi and mixed speech are detected automatically. Uses the same Groq key as image review.", "90 सेकंड तक बोलें, फिर रोकें। अंग्रेज़ी, हिन्दी और मिश्रित भाषा अपने आप पहचानी जाती है। तस्वीर समीक्षा वाली Groq कुंजी ही उपयोग होती है।")}</p>{!ai?.configured && <div className="notice warning">{t("Run configure-ai.cmd, restart the backend and refresh this page to enable API voice input.", "API वॉइस के लिए configure-ai.cmd चलाएँ, बैकएंड फिर शुरू करें और पृष्ठ रीफ़्रेश करें।")}</div>}<label className="consent"><input type="checkbox" checked={allowVoiceCloud} disabled={blocked} onChange={e => setAllowVoiceCloud(e.target.checked)} /><span>{t("Send my recording to Groq for transcription when I press Stop. Free-plan limits apply.", "रोकने पर मेरी रिकॉर्डिंग पाठ बनाने के लिए Groq को भेजें। मुफ़्त योजना की सीमाएँ लागू हैं।")}</span></label></>}
+        <div className="voice-row"><button className={`secondary ${speech.listening ? "recording" : ""}`} disabled={busy || voiceProcessing || !speech.supported || (voiceMode === "api" && (!allowVoiceCloud || !ai?.configured))} onClick={() => speech.listening ? speech.stop() : speech.start(inputType === "tapped_option" ? "" : draft)}>{speech.listening ? <Square size={16} /> : <Mic size={18} />}{speech.listening ? t("Stop recording", "रिकॉर्डिंग रोकें") : t("Speak your answer", "अपना उत्तर बोलें")}</button><span role="status">{voiceProcessing ? t("Transcribing your recording…", "रिकॉर्डिंग को पाठ में बदल रहे हैं…") : voiceMode === "api" && recordedSpeech.starting ? t("Waiting for microphone permission…", "माइक्रोफ़ोन की अनुमति की प्रतीक्षा…") : speech.listening ? t("Listening… speak naturally, then press Stop.", "सुन रहे हैं… सामान्य रूप से बोलें, फिर रोकें।") : t("Check your words before continuing.", "आगे बढ़ने से पहले अपना उत्तर जाँचें।")}</span></div>
+        {voiceMode === "api" && speech.listening && <div className="mic-feedback"><meter min={0} max={1} value={recordedSpeech.level} aria-label={t("Microphone level", "माइक्रोफ़ोन स्तर")} /><span>{recordedSpeech.seconds}s / 90s</span><small>{t("If the meter stays flat while speaking, check your selected microphone.", "बोलते समय स्तर नहीं बदलता तो चुना हुआ माइक्रोफ़ोन जाँचें।")}</small></div>}
+        {voiceMode === "api" && (speech.listening || voiceProcessing || voicePending) && <div className="actions">{voicePending && !voiceProcessing && <button className="secondary" disabled={busy || !allowVoiceCloud} onClick={recordedSpeech.retry}>{t("Retry transcription", "पाठ बनाने की फिर कोशिश करें")}</button>}<button className="text-button" onClick={recordedSpeech.cancel}>{t("Discard recording", "रिकॉर्डिंग रद्द करें")}</button></div>}
+        {speech.error && <p className="speech-error" role="alert">{speech.error}</p>}{!speech.supported && <p className="small-note">{t("Microphone input is unavailable here. Open localhost:3000 in Chrome or Edge, or type your answer.", "यहाँ माइक्रोफ़ोन उपलब्ध नहीं है। Chrome या Edge में localhost:3000 खोलें या उत्तर लिखें।")}</p>}
+        {voiceMode === "browser" && <p className="small-note">{t("This method depends on your browser's online speech service. If it cannot connect, select Record & transcribe above. API recording requires the separate checkbox.", "यह तरीका ब्राउज़र की ऑनलाइन वॉइस सेवा पर निर्भर है। संपर्क विफल हो तो ऊपर रिकॉर्ड करें और पाठ बनाएँ चुनें। API के लिए अलग अनुमति आवश्यक है।")}</p>}</div></>}
+        <div className="actions split divider"><button className="secondary" disabled={blocked} onClick={backAnswer}><ArrowLeft size={17} />{t("Back", "पीछे")}</button>{!data?.next.completed && <button className="primary" disabled={blocked || !draft.trim()} onClick={sendAnswer}>{t("Save & continue", "सहेजें और आगे बढ़ें")}<ArrowRight size={17} /></button>}</div></div><aside className="history-panel"><span className="eyebrow">{t("YOUR STORY SO FAR", "अब तक आपकी जानकारी")}</span><h3>{t("Saved answers", "सहेजे गए उत्तर")}</h3><p>{t("Use Back to correct the last answer. Editing an earlier answer reopens the questions after it.", "अंतिम उत्तर सुधारने के लिए पीछे जाएँ। पहले का उत्तर बदलने पर उसके बाद के प्रश्न फिर खुलेंगे।")}</p>{!answers.length && <div className="empty-history"><Pencil size={25} /><p>{t("Your answers will appear here.", "आपके उत्तर यहाँ दिखाई देंगे।")}</p></div>}{answers.map(fact => <div className="history-item" key={fact.id}><small>{fact.question || fact.label}</small><strong>{fact.display_value || fact.value}</strong><button className="text-button" disabled={blocked} onClick={() => setEditTarget(fact)}><Pencil size={13} />{t("Edit", "बदलें")}</button></div>)}</aside></div>}
+        {editTarget && <div className="notice"><h3>{t("Edit this answer?", "यह उत्तर बदलें?")}</h3><p>“{editTarget.display_value || editTarget.value}”</p><p>{t("This answer and all later interview answers will reopen. Documents stay saved; the physician draft must be reviewed again.", "यह उत्तर और इसके बाद के प्रश्न फिर खुलेंगे। दस्तावेज़ सुरक्षित रहेंगे; डॉक्टर को मसौदा फिर जाँचना होगा।")}</p><div className="actions"><button className="secondary" disabled={blocked} onClick={() => setEditTarget(null)}>{t("Cancel", "रद्द करें")}</button><button className="primary" disabled={blocked} onClick={() => rewind(editTarget)}>{t("Reopen answer", "उत्तर फिर खोलें")}</button></div></div>}
+        {step === 4 && <div className="panel"><span className="icon-box"><FileScan /></span><h2>{t("Your records, in one place.", "आपके रिकॉर्ड, एक जगह।")}</h2><p>{t("Add a clear photo of a printed prescription or lab report. Check the extracted text before review.", "छपे हुए पर्चे या लैब रिपोर्ट की साफ़ तस्वीर जोड़ें। समीक्षा से पहले निकाला गया पाठ जाँचें।")}</p><label className="field-label" htmlFor="ocr-language">{t("Document language", "दस्तावेज़ की भाषा")}</label><select id="ocr-language" disabled={busy} value={ocrLanguage} onChange={e => setOcrLanguage(e.target.value as Lang)}><option value="en">{t("English document", "अंग्रेज़ी दस्तावेज़")}</option><option value="hi">{t("Hindi / mixed Hindi and English", "हिन्दी / हिन्दी और अंग्रेज़ी मिश्रित")}</option></select><label className="upload-zone"><FileScan size={32} /><strong>{t("Choose a medical document", "चिकित्सा दस्तावेज़ चुनें")}</strong><span>{t("PNG or JPG · Up to 10 MB · Printed Hindi & English", "PNG या JPG · अधिकतम 10 MB · छपी हिन्दी और अंग्रेज़ी")}</span><input aria-label={t("Upload medical document", "चिकित्सा दस्तावेज़ अपलोड करें")} type="file" accept="image/png,image/jpeg" disabled={busy} onChange={upload} /></label><div className="actions"><button className="secondary" disabled={busy || data?.documents.some(doc => doc.filename.startsWith("demo_"))} onClick={() => void run(async () => { apply(await request("/documents/process", { session_id: data?.session.id })); })}>{t("Try the two sample documents", "दो नमूना दस्तावेज़ आज़माएँ")}</button><span className="small-note">{t("First use downloads OCR models. Keep the backend running.", "पहली बार OCR मॉडल डाउनलोड होते हैं। बैकएंड चालू रखें।")}</span></div>{data?.documents.map(doc => <div key={doc.id} className="document-row"><CheckCircle2 size={20} /><span>{doc.filename}</span><span className="badge">{Math.round(doc.confidence * 100)}% {t("OCR confidence", "OCR विश्वास")}</span><DeleteDocumentButton busy={busy} language={language} remove={() => removeDocument(doc)} /></div>)}<div className="actions split divider"><button className="secondary" disabled={busy} onClick={() => go(3)}><ArrowLeft size={17} />{t("Back to history", "इतिहास पर वापस")}</button><button className="primary" disabled={busy} onClick={() => go(5)}>{data?.documents.length ? t("Review records", "रिकॉर्ड की समीक्षा") : t("Continue without documents", "दस्तावेज़ के बिना आगे बढ़ें")}<ArrowRight size={17} /></button></div></div>}
+        {step === 5 && <>{hasUnsavedDocuments && <div className="notice warning" role="status">{t("Save or discard your document text edits before continuing.", "आगे बढ़ने से पहले दस्तावेज़ के बदलाव सहेजें या रद्द करें।")}</div>}<div className="section-heading"><span className="eyebrow">{t("CHECK THE DETAILS", "जानकारी जाँचें")}</span><h2>{t("Does everything look right?", "क्या सभी जानकारी सही है?")}</h2><p>{t("Correct OCR text before generating the physician draft. Extracted facts require review.", "डॉक्टर का मसौदा बनाने से पहले OCR पाठ सुधारें। निकाली गई जानकारी की समीक्षा आवश्यक है।")}</p></div>{data?.documents.map(doc => <DocumentEditor key={`${doc.id}:${doc.revision}`} doc={doc} language={language} busy={busy} ai={ai} imageUrl={`${API}/documents/${doc.id}/image?session_id=${encodeURIComponent(data.session.id)}`} onDirty={markDirty} remove={() => removeDocument(doc)} reviewWithAI={async () => { if (lock.current) throw new Error("Another request is running. Please wait."); lock.current = true; setBusy(true); try { apply(await request(`/documents/${doc.id}/ai-review`, { session_id: data.session.id, revision: doc.revision, allow_external_processing: true }), false); } finally { lock.current = false; setBusy(false); } }} save={(text, review) => void run(async () => { const result = await request(`/documents/${doc.id}/text`, { session_id: data.session.id, text, revision: doc.revision, ai_suggestion_id: review?.suggestionId, confirm_reviewed: review?.confirmed || false }); markDirty(doc.id, false); apply(result); })} />)}<div className="panel"><h3>{t("Patient history", "मरीज़ का इतिहास")}</h3>{answers.map(fact => <div className="fact-row" key={fact.id}><div><small>{fact.question || fact.label}</small><p>{fact.display_value || fact.value}</p></div><button className="text-button" disabled={busy || hasUnsavedDocuments} onClick={() => { setEditTarget(fact); go(3); }}><Pencil size={15} />{t("Edit", "बदलें")}</button></div>)}</div><div className="actions split"><button className="secondary" disabled={busy || hasUnsavedDocuments} onClick={() => go(4)}><ArrowLeft size={17} />{t("Documents", "दस्तावेज़")}</button><button className="primary" disabled={busy || hasUnsavedDocuments} onClick={loadSummary}>{t("Prepare physician draft", "डॉक्टर का मसौदा बनाएँ")}<ArrowRight size={17} /></button></div></>}
+        {step === 6 && <div className="panel"><span className="badge">{t("PHYSICIAN WORKSPACE · DEMO", "चिकित्सक कार्यक्षेत्र · डेमो")}</span><h2>{t("Review before approval.", "स्वीकृति से पहले समीक्षा करें।")}</h2><p>{t("The clinical draft and documents retain their original language. A physician should verify and amend the content before exporting.", "चिकित्सकीय मसौदा और दस्तावेज़ मूल भाषा में रहते हैं। निर्यात से पहले डॉक्टर जानकारी की जाँच और सुधार करें।")}</p>{Boolean(data?.next.physician_pending_fields.length) && <div className="soft-box"><strong>{t("AYUSH examination still required", "आयुष परीक्षण अभी आवश्यक है")}</strong><p>{data?.next.physician_pending_fields.join(", ")}</p></div>}{data?.evidence.filter(e => e.status === "CONFLICT" || e.status === "OUT_OF_RANGE").map(e => <div className="notice warning" key={e.id}><strong>{e.status}</strong><p>{e.message}</p></div>)}<label className="field-label" htmlFor="summary">{t("Editable physician draft", "संपादन योग्य चिकित्सकीय मसौदा")}</label><textarea id="summary" className="summary-text" value={summary} disabled={busy} onChange={e => { setSummary(e.target.value); setReview("draft"); setBundle(null); setSynced(false); setFurthest(6); }} />{review === "rejected" && <p role="status">{t("Draft rejected. Amend it before approving.", "मसौदा अस्वीकृत। स्वीकृति से पहले सुधारें।")}</p>}<div className="actions split"><button className="secondary" disabled={busy} onClick={() => go(5)}><ArrowLeft size={17} />{t("Back to review", "समीक्षा पर वापस")}</button><div className="actions"><button className="secondary" disabled={busy} onClick={() => void run(async () => { await request("/physician/review", { session_id: data?.session.id, physician_id: "dr_demo", decision: "reject", edits: { summary_text: summary } }); setReview("rejected"); setBundle(null); setSynced(false); setFurthest(6); })}>{t("Reject draft", "मसौदा अस्वीकार करें")}</button><button className="primary" disabled={busy || review === "rejected" || !summary.trim()} onClick={() => void run(async () => { await request("/physician/review", { session_id: data?.session.id, physician_id: "dr_demo", decision: "accept", edits: { summary_text: summary } }); setBundle(await request("/fhir/export", { session_id: data?.session.id })); setReview("approved"); go(7); })}><Check size={18} />{t("Approve & prepare export", "स्वीकार करें और निर्यात बनाएँ")}</button></div></div></div>}
+        {step === 7 && <div className="panel narrow export-panel"><CheckCircle2 size={52} className="success-icon" /><h2>{t("Ready for the next step.", "अगले चरण के लिए तैयार।")}</h2><p>{t("The approved demo record is ready to download. Hospital sync below is a simulation.", "स्वीकृत डेमो रिकॉर्ड डाउनलोड के लिए तैयार है। नीचे अस्पताल सिंक एक अनुकरण है।")}</p><div className="resource-list">{bundle?.entry?.map((entry, i) => <span className="badge" key={i}>{entry.resource.resourceType}</span>)}</div><div className="actions"><button className="primary" disabled={busy || !bundle} onClick={() => { const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" })); const a = document.createElement("a"); a.href = url; a.download = "rx-lens-record.json"; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }}>{t("Download record", "रिकॉर्ड डाउनलोड करें")}</button><button className="secondary" disabled={busy || synced} onClick={() => void run(async () => { await request("/sync/mock", { session_id: data?.session.id }); setSynced(true); })}>{synced ? t("Demo sync complete", "डेमो सिंक पूरा") : t("Simulate hospital sync", "अस्पताल सिंक का अनुकरण")}</button></div><details><summary>{t("View export data", "निर्यात डेटा देखें")}</summary><pre>{JSON.stringify(bundle, null, 2)}</pre></details><button className="text-button" disabled={busy} onClick={() => go(6)}><ArrowLeft size={16} />{t("Back to physician review", "चिकित्सक समीक्षा पर वापस")}</button></div>}
+        <footer>{t("Rx Lens · A patient intake demo. All clinical information requires physician review.", "Rx Lens · मरीज़ की जानकारी लेने का डेमो। सभी चिकित्सकीय जानकारी की डॉक्टर द्वारा समीक्षा आवश्यक है।")}</footer>
+      </div>
+    </section>
+  </main>;
 }
 
-function IdentifyScreen({ language, setLanguage, createSession }: any) {
-  return <div className="panel grid two"><div><h3 className="question">Let&apos;s prepare your medical history before you meet the doctor.</h3><p>Demo ABHA identity, large touch targets, Hindi-first flow, and sandbox audio affordances for low-literacy use.</p></div><div className="grid control-stack"><button type="button" className="option" onClick={() => setLanguage("hi")}><Languages /> Hindi {language === "hi" && <span className="chip green">Selected</span>}</button><button type="button" className="option" onClick={() => setLanguage("en")}><Languages /> English {language === "en" && <span className="chip green">Selected</span>}</button><button type="button" className="primary" onClick={createSession} onPointerDown={(event) => event.currentTarget.classList.add("pressed")} onPointerUp={(event) => event.currentTarget.classList.remove("pressed")}><Send size={18} /> Continue with Demo ABHA</button></div></div>;
-}
-
-function ConsentScreen({ checked, setChecked, consent }: any) {
-  return <div className="panel grid"><ShieldCheck size={34} /><h3 className="question">We will collect your answers and process your uploaded medical papers so the doctor can review them.</h3><p>This is a sandbox demo. Your history, document text, and summary will be shown to the physician screen for review.</p><label className="tile"><input type="checkbox" checked={checked} onChange={(event) => setChecked(event.target.checked)} /> I understand and consent.</label><div className="actions"><button className="secondary" onClick={() => alert("Sandbox audio: consent explanation would be spoken aloud here.")}><Volume2 size={18} /> Listen</button><button className="primary" disabled={!checked} onClick={consent}>Continue</button></div></div>;
-}
-
-function ModeScreen({ patient, selectMode }: any) {
-  return <div className="panel grid two"><div className="tile"><h3>Demo Patient</h3><p>{patient?.name}, {patient?.age}, {patient?.sex}</p><span className="chip amber">{patient?.abha_id}</span></div><button className="tile" onClick={() => selectMode("general_medicine")}><Stethoscope /><h3>General Medicine Golden Path</h3><p>Chest pain, SOCRATES follow-up, breathlessness red flag, document evidence, physician review.</p></button><button className="tile" onClick={() => selectMode("ayush")}><HeartPulse /><h3>Show AYUSH Mode</h3><p>Dashavidha-oriented patient intake with physician assessment pending fields.</p></button></div>;
-}
-
-function InterviewScreen({ prompt, submitAnswer, sandboxVoice, voiceState }: any) {
-  return <div className="panel grid"><h3 className="question">{prompt?.question || "Interview complete"}</h3><div className="grid two"><button className="tile" onClick={sandboxVoice}><Mic /><h3>{voiceState === "listening" ? "Listening..." : "Sandbox voice"}</h3><p>{voiceState === "ready" ? "Transcript: Subah se seene mein dard hai." : "Tap to simulate one controlled ASR transcript."}</p></button><div className="grid">{prompt?.options?.map((option: string) => <button className="option" key={option} onClick={() => submitAnswer(option)}>{option}</button>)}</div></div></div>;
-}
-
-function DocumentsScreen({ uploadDocument, processDemoDocuments }: any) {
-  return <div className="panel grid"><FileScan size={34} /><h3 className="question">Add previous medical documents.</h3><p>Real OCR path: uploaded PNG/JPG is read by EasyOCR, converted to extracted text, then structured into labs, medications, allergies, evidence, and timeline.</p><input type="file" accept="image/png,image/jpeg" onChange={uploadDocument} /><div className="actions"><button className="primary" onClick={processDemoDocuments}>Run included demo documents through OCR</button></div></div>;
-}
-
-function ReviewScreen({ documents, facts, evidence, loadSummary }: any) {
-  return <div className="panel grid summary"><div className="grid">{documents.map((doc: DocumentRecord) => <div className="tile" key={doc.id}><span className="chip green">Original uploaded file: {doc.filename}</span><h3>Extracted text</h3><pre>{doc.ocr_text}</pre><h3>Clinical structure</h3><pre>{JSON.stringify(doc.extracted, null, 2)}</pre></div>)}</div><div className="grid">{facts.map((fact: Fact) => <div className="fact" key={fact.id}><strong>{fact.label}</strong>{fact.value}<br /><span className="chip">{fact.source}</span></div>)}{evidence.map((ev: Evidence) => <div className="tile" key={ev.fact_ids.join("-")}><span className={`chip ${ev.status === "CONFLICT" ? "red" : ev.status === "OUT_OF_RANGE" ? "amber" : ""}`}>{ev.status}</span><p>{ev.message}</p></div>)}<button className="primary" onClick={loadSummary}>Generate physician draft</button></div></div>;
-}
-
-function PhysicianScreen({ patient, evidence, prompt, summary, editedSummary, setEditedSummary, reviewState, setReviewState, approveAndExport, rejectDraft }: any) {
-  return <div className="panel grid summary"><div><h3>{patient?.name}</h3><p className={`chip ${reviewState === "approved" ? "green" : reviewState === "rejected" ? "red" : "amber"}`}>{reviewState === "approved" ? "PHYSICIAN VERIFIED" : reviewState === "rejected" ? "Draft rejected" : summary?.label}</p><textarea value={editedSummary} onChange={(event) => { setEditedSummary(event.target.value); setReviewState("editing"); }} /></div><div className="grid">{prompt?.physician_pending_fields?.length > 0 && <div className="tile"><h3>AYUSH physician assessment pending</h3><p>{prompt.physician_pending_fields.join(", ")}</p><span className="chip violet">Not self-reported or inferred</span></div>}{evidence.map((ev: Evidence) => <div className="tile" key={ev.fact_ids.join("-")}><span className="chip red">{ev.status}</span><p>{ev.message}</p></div>)}<button className="secondary" onClick={() => setReviewState("editing")}>Amend</button><button className="secondary" onClick={rejectDraft}>Reject</button><button className="primary" disabled={reviewState === "rejected"} onClick={approveAndExport}>Approve and export</button></div></div>;
-}
-
-function FhirScreen({ fhir, sync, synced }: any) {
-  const resources = fhir?.entry?.map((entry: any) => entry.resource.resourceType) || [];
-  return <div className="panel grid"><h3 className="question">FHIR Bundle Preview</h3><div className="grid three">{resources.map((resource: string, index: number) => <div className="tile" key={`${resource}-${index}`}><span className="chip green">{resource}</span></div>)}</div><details><summary>View technical payload</summary><pre>{JSON.stringify(fhir, null, 2)}</pre></details><div className="actions"><button className="primary" onClick={sync}>Sync to sandbox ABDM/HIS</button><span className={`chip ${synced ? "green" : "amber"}`}>{synced ? "Sandbox Sync Complete" : "Ready"}</span></div></div>;
-}
-
-function ArchitecturePanel() {
-  const rows = [["Clinical interview", "Working deterministic/adaptive engine"], ["Red-flag rules", "Working deterministic rules"], ["AYUSH intake", "Working POC pathway"], ["Document extraction", "Real EasyOCR for high-quality printed English images"], ["Voice", "Sandbox ASR adapter; target Bhashini / AI4Bharat"], ["Physician review", "Working approve/amend/reject"], ["FHIR generation", "Working POC bundle generation"], ["ABDM / HIS", "Simulated connector"], ["Data", "In-memory sandbox store; target secure persistent datastore"]];
-  return <div className="panel grid"><h3 className="question">Sandbox Architecture</h3>{rows.map(([name, detail]) => <div className="fact" key={name}><strong>{name}</strong>{detail}</div>)}</div>;
-}
-
-async function postJson(path: string, body: unknown) {
-  const response = await fetch(`${API}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}

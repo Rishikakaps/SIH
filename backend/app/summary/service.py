@@ -14,6 +14,7 @@ def generate_summary(session: Session, facts: list[ClinicalFact], flags: list[Cl
         "evidence": [{"status": ev.status, "message": ev.message, "fact_ids": ev.fact_ids} for ev in evidence],
         "red_flags": [flag.model_dump() for flag in flags],
         "mode": session.mode,
+        "patient_history": [{"field": f.label, **_fact_line(f)} for f in facts if f.source == "patient_interview"],
         "traceable_fact_ids": [fact.id for fact in facts],
     }
     return {"label": "AI-generated draft - physician verification required", "sections": sections}
