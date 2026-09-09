@@ -53,9 +53,10 @@ def process_document(
     doc_type_hint: str | None,
     raw: bytes | None = None,
     text: str | None = None,
+    ocr_language: str = "en",
 ) -> tuple[DocumentRecord, list[ClinicalFact], list[TimelineEvent]]:
-    if text is None and raw:
-        ocr = ocr_image_bytes(raw)
+    if text is None and raw is not None:
+        ocr = ocr_image_bytes(raw, ocr_language)
         text = ocr.text
         confidence = ocr.confidence
     else:
@@ -68,10 +69,14 @@ def process_document(
         filename=filename,
         doc_type_hint=doc_type_hint,
         ocr_text=text,
+        original_ocr_text=text,
         confidence=confidence,
         extracted=extracted,
     )
+    doc.status = "needs_review" if confidence < 0.75 else "processed"
     facts = facts_from_extraction(session_id, doc.id, extracted)
+    for fact in facts:
+        fact.confidence = confidence
     timeline = timeline_from_extraction(session_id, doc.id, filename, extracted, facts)
     return doc, facts, timeline
 
@@ -155,14 +160,18 @@ def _extract_labs(text: str) -> list[dict[str, object]]:
         return []
     value_match = re.search(r"value:\s*([0-9]+(?:\.[0-9]+)?)\s*(%)?", text, flags=re.IGNORECASE)
     range_match = re.search(r"reference range:\s*([0-9]+(?:\.[0-9]+)?)-([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
-    value = float(value_match.group(1)) if value_match else 0.0
+    if not value_match:
+        value_match = re.search(r"hba1c\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%", text, flags=re.IGNORECASE)
+    if not value_match:
+        return []  # Missing data is unknown, never a fabricated zero.
+    value = float(value_match.group(1))
     reference = [float(range_match.group(1)), float(range_match.group(2))] if range_match else None
     abnormal = bool(reference and (value < reference[0] or value > reference[1]))
     return [{"name": "HbA1c", "value": value, "unit": "%", "reference_range": reference, "abnormal": abnormal}]
 
 
 def _normalize_ocr_text(text: str) -> str:
-    return re.sub(r"hba[iIl|]c", "HbA1c", text, flags=re.IGNORECASE)
+    return re.sub(r"\bhb\s*a\s*[1il|]\s*c\b", "HbA1c", text, flags=re.IGNORECASE)
 
 
 def _extract_date(text: str) -> str | None:
@@ -184,6 +193,7 @@ def _demo_font(size: int):
     from PIL import ImageFont
 
     for candidate in [
+        "C:/Windows/Fonts/arial.ttf",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Helvetica.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
